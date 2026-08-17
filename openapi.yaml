@@ -3,27 +3,30 @@ openapi: 3.1.0
 # ---------------------------------------------------------------------------
 # Settla — public API contract.
 #
-# STATUS: only the two /api/verify operations are implemented. Everything under
-# /v1 is a proposal, marked `x-settla-status: proposed`, and no server will
-# answer it today. See README.md.
+# STATUS: /v1 is live. Operations marked `x-settla-status: live` answer on the
+# running service today; `proposed` operations are contract-only and answer
+# 501. The service's own declaration of its surface is GET /v1 — where this
+# file and a running answer disagree, the running answer wins. See README.md.
 # ---------------------------------------------------------------------------
 
 info:
   title: Settla API
-  version: "2026-08-13"
+  version: "2026-08-17"
   summary: Programmatic payments where a human BankID signature is the final word.
   description: |
-    Settla never holds money. Payments settle directly from the payer's own bank
-    account to the recipient, and no API call can create a Settla balance.
+    Settla never holds money. A payment is placed at the payer's own bank and
+    settles from their account to the recipient's; no API call can create a
+    Settla balance.
 
-    An API key cannot move money. A key prepares a payment; a person signs it
-    with BankID; the signature is the instruction. Every payment therefore moves
-    through `created` -> `signed` -> `executed`, and only the bank performs the
-    last step.
+    An API key cannot sign. A key prepares — places a payment, opens a bank
+    connection — and every preparation ends in a BankID signature by a named
+    human in their own BankID app. Endpoints marked `signed` in GET /v1 return
+    a SIGNING ORDER (a QR and an autostart token) for you to show, and one
+    route to poll for the result.
 
     Read `x-settla-status` on every operation before integrating. `live` means
-    it answers today. `proposed` means the contract is published for comment and
-    nothing implements it.
+    it answers today. `proposed` means the contract is published for comment
+    and the operation answers 501.
   contact:
     name: Settla
     url: https://github.com/Authenticate-eID-Sweden-AB/settla-api
@@ -33,25 +36,638 @@ info:
 servers:
   - url: https://test.settla.se
     description: |
-      The running portal. Serves the two live verification operations. It is a
-      test host, it will change, and it does not serve /v1.
+      The running service. It is a test host, it will change; do not hard-code
+      it.
 
 tags:
-  - name: Verification
-    description: Public, unauthenticated. Holding the file is the entitlement.
+  - name: Discovery
+    description: What the API can do, from the API itself. No key needed.
+  - name: Account
+    description: The account behind the key, and its API keys.
+  - name: Banks
+    description: Connecting banks and reading accounts, balances and transactions.
   - name: Payments
-    description: Prepare payments for a human to sign.
+    description: Place payments for a human to sign, follow them, withdraw unsigned ones.
+  - name: Signing orders
+    description: The BankID orders behind every `signed` endpoint.
   - name: Payment requests
     description: Ask someone for money. The payer needs no Settla account.
-  - name: Checkout
-    description: Hosted checkout for merchants.
   - name: Documents
-    description: Send a document for signature and read who is outstanding.
+    description: Documents sent for signature, and their BankID evidence.
+  - name: Events
+    description: Being told, rather than asking.
+  - name: Verification
+    description: Public, unauthenticated. Holding the file is the entitlement.
+  - name: Checkout
+    description: Hosted checkout for merchants. Proposed.
 
 security:
   - ApiKey: []
 
 paths:
+  # -------------------------------------------------------------- discovery
+  /v1:
+    get:
+      tags: [Discovery]
+      operationId: getCapabilities
+      x-settla-status: live
+      summary: Every capability, each marked read, act or signed
+      description: |
+        Unauthenticated on purpose: somebody deciding whether to build against
+        this should be able to read what it does before they have an account.
+        A declared capability that is not built yet answers 501 when called —
+        a roadmap, not a bug.
+      security: []
+      responses:
+        "200":
+          description: The capability list and the signing rule.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  service: {type: string, const: settla}
+                  version: {type: string, const: v1}
+                  signing: {type: string}
+                  capabilities:
+                    type: array
+                    items: {$ref: "#/components/schemas/Capability"}
+
+  /v1/me:
+    get:
+      tags: [Account]
+      operationId: getMe
+      x-settla-status: live
+      summary: The account behind this key
+      description: |
+        Deliberately not the personal number. A key is often held by a script
+        on a server that has no business holding one; the name and username
+        say which account you are talking to.
+      responses:
+        "200":
+          description: The account.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  username: {type: [string, "null"]}
+                  email: {type: [string, "null"]}
+                  onboarding:
+                    type: object
+                    properties:
+                      complete: {type: boolean, const: true}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/NotOnboarded"}
+
+  # ------------------------------------------------------------------ banks
+  /v1/banks:
+    get:
+      tags: [Banks]
+      operationId: listBanks
+      x-settla-status: live
+      summary: Banks that can be connected and paid from
+      description: |
+        `ais` and `pis` are separate answers on purpose: a bank can be readable
+        but not payable. Both mean proven-and-current, not merely "an adapter
+        exists" — a bank that cannot take a payment today is not offered as
+        though it could.
+      responses:
+        "200":
+          description: The banks.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  banks:
+                    type: array
+                    items: {$ref: "#/components/schemas/Bank"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/bank-connections:
+    post:
+      tags: [Banks]
+      operationId: connectBank
+      x-settla-status: live
+      summary: Connect a bank — returns a signing order
+      description: |
+        Raises the bank's own BankID order. Show the returned QR, or on the
+        device that holds the BankID app pass `same_device: true` and launch
+        the autostart token. Poll the order; on completion it carries the
+        connected accounts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bank]
+              properties:
+                bank:
+                  type: string
+                  description: A bank id from GET /v1/banks, e.g. `nordea`.
+                same_device:
+                  type: boolean
+                  default: false
+                  description: |
+                    The person is on the device that holds their BankID app.
+                    Some banks fix the signing mode when the order is raised —
+                    an order raised for a QR never yields an autostart token,
+                    so this cannot be corrected afterwards.
+                user_ip:
+                  type: string
+                  description: The person's own IP, where your system honestly knows it.
+      responses:
+        "201":
+          description: A pending signing order.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SigningOrderEnvelope"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "503":
+          description: The bank cannot be connected right now; the message says why.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
+  /v1/accounts:
+    get:
+      tags: [Banks]
+      operationId: listAccounts
+      x-settla-status: live
+      summary: Every account at every connected bank, with balances
+      description: |
+        One call, whatever banks the person has connected — the caller never
+        names a bank. A bank that fails is reported in its row, never omitted:
+        an overview that quietly drops a bank tells somebody they have less
+        money than they do.
+
+        `?refresh=false` answers from the last poll without touching the
+        banks. Use it for anything on a timer: live balance reads are counted
+        against daily ceilings at some banks.
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          schema: {type: string, enum: ["true", "false"], default: "true"}
+        - $ref: "#/components/parameters/UserIp"
+      responses:
+        "200":
+          description: The overview.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/AccountsOverview"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/accounts/{id}/transactions:
+    get:
+      tags: [Banks]
+      operationId: listTransactions
+      x-settla-status: live
+      summary: Transactions for one account
+      description: |
+        From the service's own ledger — the year backfilled when the account
+        was first seen, and everything the scheduled polling has added since.
+        No bank round trip, so poll freely.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: An account id (or account number) from GET /v1/accounts.
+          schema: {type: string}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 200}
+      responses:
+        "200":
+          description: The transactions, newest first.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TransactionsAnswer"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # ----------------------------------------------------------------- payments
+  /v1/payments:
+    post:
+      tags: [Payments]
+      operationId: placePayment
+      x-settla-status: live
+      summary: Place one payment — returns a signing order
+      description: |
+        The payment is placed at the payer's bank and the bank's own BankID
+        signing order is opened. Nothing has moved when this returns — the
+        payment is unsigned and still cancellable — but the person's next
+        action in their BankID app is irrevocable, so the amount, recipient
+        and source shown to them are the ones sent here.
+
+        The bank is resolved from `from_account`; naming `bank` explicitly is
+        allowed and settles ambiguity.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/PaymentPlace"}
+      responses:
+        "201":
+          description: A pending signing order. Poll it; the QR rotates.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SigningOrderEnvelope"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409":
+          description: |
+            `bank_connection_expired` — the connection behind `from_account`
+            has lapsed. Reconnect with POST /v1/bank-connections and place the
+            payment again.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "502":
+          description: |
+            `bank_refused` — the bank refused the placement. The message is
+            the bank's own reason, passed through.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "503":
+          description: Payments from this bank are not available; the message says why.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+    get:
+      tags: [Payments]
+      operationId: listPayments
+      x-settla-status: live
+      summary: Payments placed through Settla, with the bank's own status
+      description: |
+        Merged across every connected bank, newest first. `label` and `detail`
+        are human-readable words about what the bank has said — they never say
+        "settled" or "paid"; that conclusion belongs to the recipient's bank
+        statement.
+      responses:
+        "200":
+          description: The payments.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payments:
+                    type: array
+                    items: {$ref: "#/components/schemas/Payment"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/payments/{id}:
+    get:
+      tags: [Payments]
+      operationId: getPayment
+      x-settla-status: live
+      summary: One payment, by the id from the payments list
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: The payment.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  payment: {$ref: "#/components/schemas/Payment"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /v1/payments/{orderId}/cancel:
+    post:
+      tags: [Payments]
+      operationId: cancelPayment
+      x-settla-status: live
+      summary: Withdraw an unsigned payment, by its order id
+      description: |
+        Only an unsigned payment can be withdrawn, and the order from POST
+        /v1/payments is what identifies one. An abandoned attempt withdrawn
+        here leaves nothing behind at the bank.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          description: The `order.id` returned when the payment was placed.
+          schema: {type: string}
+      responses:
+        "200":
+          description: The outcome.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelled: {type: boolean}
+                  reason: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /v1/payments/batch:
+    post:
+      tags: [Payments]
+      operationId: placeBatch
+      x-settla-status: proposed
+      summary: Several payments under one signature
+      description: |
+        Proposed, and bank-dependent by nature: not every bank offers a basket
+        a single signature can cover, and the service refuses combinations the
+        bank cannot honour rather than letting them die after placement.
+      responses:
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  # ------------------------------------------------------------ signing orders
+  /v1/orders/{id}:
+    get:
+      tags: [Signing orders]
+      operationId: pollOrder
+      x-settla-status: live
+      summary: Poll a signing order
+      description: |
+        While `pending`, every answer carries the freshest QR and autostart
+        token — the QR rotates about once a second, so render what the latest
+        poll returns. On completion a payment order carries the payment's
+        outcome; a bank-connection order carries the connected accounts.
+
+        Orders are minutes-long and held in memory: after a service restart an
+        order answers 404. Place again — the idempotency key resolves to the
+        payment that already exists.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: The order's state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SigningOrderEnvelope"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # ---------------------------------------------------------- payment requests
+  /v1/payment-requests:
+    post:
+      tags: [Payment requests]
+      operationId: createPaymentRequest
+      x-settla-status: live
+      summary: Ask one or more people to pay; returns and mails a link per payer
+      description: |
+        A request records what was asked; it moves no money. Each participant
+        gets their own link — the link is the whole relationship, and the
+        payer needs no Settla account to use it. Participants with an email
+        are mailed their link; any that could not be mailed are listed in
+        `unsent`, with the links in the response so your system can deliver
+        them itself.
+
+        Money asked for lands on the requester's payout account as it stands
+        when each share is paid — not as it stood when the request was made.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [total, people]
+              properties:
+                kind:
+                  type: string
+                  enum: [single, group]
+                  default: single
+                  description: |
+                    `group` splits the total evenly, remainder distributed an
+                    öre at a time rather than dropped.
+                total: {$ref: "#/components/schemas/Amount"}
+                message: {type: string, maxLength: 200}
+                people:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  description: |
+                    One entry per person asked. A string containing `@` is an
+                    email; any other string is a name. Objects with `name`
+                    and/or `email` are also accepted.
+                  items:
+                    oneOf:
+                      - type: string
+                      - type: object
+                        properties:
+                          name: {type: string}
+                          email: {type: string, format: email}
+      responses:
+        "201":
+          description: The request, with each participant's link.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PaymentRequest"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409":
+          description: The request could not be created; the message says why.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+    get:
+      tags: [Payment requests]
+      operationId: listPaymentRequests
+      x-settla-status: live
+      summary: Requests sent, and who has paid
+      responses:
+        "200":
+          description: The requests, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requests:
+                    type: array
+                    items: {$ref: "#/components/schemas/PaymentRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/payment-requests/{id}/cancel:
+    post:
+      tags: [Payment requests]
+      operationId: cancelPaymentRequest
+      x-settla-status: live
+      summary: Withdraw a request
+      description: |
+        Cancelling stops what has not happened; it does not unwind what has.
+        Participants who already paid keep their record, and the link stops
+        working for the rest.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Withdrawn.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelled: {type: boolean, const: true}
+                  id: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # ----------------------------------------------------------------- documents
+  /v1/documents:
+    get:
+      tags: [Documents]
+      operationId: listDocuments
+      x-settla-status: live
+      summary: Documents sent for signature, with signing state
+      responses:
+        "200":
+          description: The documents, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  documents:
+                    type: array
+                    items: {$ref: "#/components/schemas/DocumentSummary"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      tags: [Documents]
+      operationId: createDocument
+      x-settla-status: proposed
+      summary: Upload a document and name its signatories
+      description: Proposed. Until it is built, documents are sent from the portal.
+      responses:
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /v1/documents/{id}/sign:
+    post:
+      tags: [Documents]
+      operationId: signDocument
+      x-settla-status: proposed
+      summary: Sign a document — returns a BankID order
+      responses:
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /v1/documents/{id}/evidence:
+    get:
+      tags: [Documents]
+      operationId: getDocumentEvidence
+      x-settla-status: live
+      summary: The BankID evidence for a document you sent
+      description: |
+        The same material as the public verifier's evidence bundle, under a
+        different entitlement: there, holding the file proves the right to
+        read; here, being the document's sender does.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: The evidence.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/EvidenceBundle"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # ------------------------------------------------------------------ the keys
+  /v1/api-keys:
+    get:
+      tags: [Account]
+      operationId: listApiKeys
+      x-settla-status: live
+      summary: This account's keys. Never the secrets.
+      description: |
+        A key can see its siblings and never a secret — the record has no
+        field for one. Enumerating and revoking from code is what makes
+        rotation automatable, which is what makes it happen.
+      responses:
+        "200":
+          description: The keys.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items: {$ref: "#/components/schemas/ApiKey"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /v1/api-keys/{id}/revoke:
+    post:
+      tags: [Account]
+      operationId: revokeApiKey
+      x-settla-status: live
+      summary: Kill a key immediately
+      description: |
+        A key revoking itself is allowed and is the correct response to a
+        leak: the next call with it fails, including this one's caller.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, pattern: "^[0-9a-f]{16}$"}
+      responses:
+        "200":
+          description: Revoked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked: {type: boolean, const: true}
+                  id: {type: string}
+                  self: {type: boolean, description: Whether the key revoked itself.}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  # ------------------------------------------------------------------- events
+  /v1/events:
+    get:
+      tags: [Events]
+      operationId: streamEvents
+      x-settla-status: live
+      summary: A held-open stream of nudges about this account
+      description: |
+        Server-Sent Events. An event says *look again* — a topic and a short
+        reason, never the state itself. A client that missed events while
+        disconnected re-reads the resources on reconnect and is correct again.
+        Nothing personal travels on the stream.
+      responses:
+        "200":
+          description: "`text/event-stream`. Held open; keep-alive pings arrive on a timer."
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  # ----------------------------------------------------------------- checkout
+  /v1/checkout/sessions:
+    post:
+      tags: [Checkout]
+      operationId: createCheckoutSession
+      x-settla-status: proposed
+      summary: Hand a customer to Settla's hosted checkout and get them back
+      responses:
+        "501": {$ref: "#/components/responses/NotImplemented"}
+
   # ------------------------------------------------------------- verification
   /api/verify:
     post:
@@ -116,604 +732,401 @@ paths:
         "404":
           description: No document with that hash.
 
-  # ----------------------------------------------------------------- payments
-  /v1/payments:
-    post:
-      tags: [Payments]
-      operationId: createPayment
-      x-settla-status: proposed
-      summary: Prepare one payment for signature
-      description: |
-        Creates a payment in `created` and returns a `sign_url`. Nothing is sent
-        to any bank. Give the URL to the person who must sign; they identify
-        with BankID, see the recipient, amount and reference, and sign.
-
-        The payer needs no Settla account.
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
-        - $ref: "#/components/parameters/SettlaVersion"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: {$ref: "#/components/schemas/PaymentCreate"}
-      responses:
-        "201":
-          description: Prepared, and waiting for a signature.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/Payment"}
-        "400": {$ref: "#/components/responses/BadRequest"}
-        "401": {$ref: "#/components/responses/Unauthorized"}
-        "409": {$ref: "#/components/responses/IdempotencyConflict"}
-        "422": {$ref: "#/components/responses/ValidationFailed"}
-
-  /v1/payments/batch:
-    post:
-      tags: [Payments]
-      operationId: createPaymentBatch
-      x-settla-status: proposed
-      summary: Prepare several payments settled under one signature
-      description: |
-        The batch is what an invoice run wants: one BankID signature covering
-        every payment in it. The signature text names each recipient and amount
-        and the total, so the signer sees what they are committing to rather
-        than a count.
-
-        A batch is all-or-nothing at signing. Individual payments can still fail
-        at the bank afterwards, and each carries its own `executed_at`.
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
-        - $ref: "#/components/parameters/SettlaVersion"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [payments]
-              properties:
-                payments:
-                  type: array
-                  minItems: 1
-                  maxItems: 200
-                  items: {$ref: "#/components/schemas/PaymentCreate"}
-                signer:
-                  $ref: "#/components/schemas/SignerHint"
-      responses:
-        "201":
-          description: Prepared. One `sign_url` covers the batch.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/PaymentBatch"}
-        "400": {$ref: "#/components/responses/BadRequest"}
-        "401": {$ref: "#/components/responses/Unauthorized"}
-        "422": {$ref: "#/components/responses/ValidationFailed"}
-
-  /v1/payments/{id}:
-    get:
-      tags: [Payments]
-      operationId: getPayment
-      x-settla-status: proposed
-      summary: Read a payment's stage
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: {type: string}
-      responses:
-        "200":
-          description: The payment.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/Payment"}
-        "401": {$ref: "#/components/responses/Unauthorized"}
-        "404": {$ref: "#/components/responses/NotFound"}
-
-  # --------------------------------------------------------- payment requests
-  /v1/payment-requests:
-    post:
-      tags: [Payment requests]
-      operationId: createPaymentRequest
-      x-settla-status: proposed
-      summary: Ask one or several people for money
-      description: |
-        A request is a claim, not a transfer. `single` asks one person for one
-        amount; `group` splits a total evenly and gives **each participant their
-        own link**, deliberately rather than one shared link — with a shared link
-        nobody can tell who has paid.
-
-        An optional PDF invoice is shown to the payer as an attachment.
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
-        - $ref: "#/components/parameters/SettlaVersion"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: {$ref: "#/components/schemas/PaymentRequestCreate"}
-      responses:
-        "201":
-          description: Created, with a pay link per participant.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/PaymentRequest"}
-        "400": {$ref: "#/components/responses/BadRequest"}
-        "401": {$ref: "#/components/responses/Unauthorized"}
-        "422": {$ref: "#/components/responses/ValidationFailed"}
-
-  /v1/payment-requests/{id}:
-    get:
-      tags: [Payment requests]
-      operationId: getPaymentRequest
-      x-settla-status: proposed
-      summary: Read who has paid and who has not
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: {type: string}
-      responses:
-        "200":
-          description: The request, with per-participant status.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/PaymentRequest"}
-        "401": {$ref: "#/components/responses/Unauthorized"}
-        "404": {$ref: "#/components/responses/NotFound"}
-
-  # ----------------------------------------------------------------- checkout
-  /v1/checkout/sessions:
-    post:
-      tags: [Checkout]
-      operationId: createCheckoutSession
-      x-settla-status: proposed
-      summary: Hand a customer to Settla's hosted checkout
-      description: |
-        The customer is redirected to `checkout_url`, identifies with BankID,
-        pays, and is returned to `return_url`.
-
-        If you ask for a delivery address, the customer must consent to
-        releasing it **for that transaction**; it is personal data, and a silent
-        prefill is not consent. A session where consent was refused completes
-        the payment and returns no address.
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
-        - $ref: "#/components/parameters/SettlaVersion"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: {$ref: "#/components/schemas/CheckoutSessionCreate"}
-      responses:
-        "201":
-          description: Session created.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/CheckoutSession"}
-        "400": {$ref: "#/components/responses/BadRequest"}
-        "401": {$ref: "#/components/responses/Unauthorized"}
-        "422": {$ref: "#/components/responses/ValidationFailed"}
-
-  # ---------------------------------------------------------------- documents
-  /v1/documents:
-    post:
-      tags: [Documents]
-      operationId: createDocument
-      x-settla-status: proposed
-      summary: Send a document for signature
-      description: |
-        Upload a PDF and name who must sign it. Each counterparty gets a link;
-        they identify with BankID **before** the document is shown, so a
-        forwarded link does not expose the contents.
-
-        Each signature produces an evidence bundle retrievable through
-        `GET /api/verify/evidence/{sha256}`, which is live today.
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
-        - $ref: "#/components/parameters/SettlaVersion"
-      requestBody:
-        required: true
-        content:
-          multipart/form-data:
-            schema:
-              type: object
-              required: [file, parties]
-              properties:
-                file: {type: string, format: binary}
-                parties:
-                  type: string
-                  description: JSON array of `{name, email}`, in signing order.
-      responses:
-        "201":
-          description: Created and sent.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/Document"}
-        "401": {$ref: "#/components/responses/Unauthorized"}
-        "422": {$ref: "#/components/responses/ValidationFailed"}
-
-  /v1/documents/{id}:
-    get:
-      tags: [Documents]
-      operationId: getDocument
-      x-settla-status: proposed
-      summary: Read who has signed and who is outstanding
-      parameters:
-        - name: id
-          in: path
-          required: true
-          schema: {type: string}
-      responses:
-        "200":
-          description: The document.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/Document"}
-        "401": {$ref: "#/components/responses/Unauthorized"}
-        "404": {$ref: "#/components/responses/NotFound"}
-
 # ---------------------------------------------------------------------- hooks
 webhooks:
   paymentSigned:
     post:
       x-settla-status: proposed
-      summary: A person signed a payment. No money has moved yet.
+      summary: A person signed a payment. Proposed — poll /v1/orders or hold /v1/events open instead.
       requestBody:
         content:
           application/json:
             schema: {$ref: "#/components/schemas/WebhookEvent"}
       responses:
         "200": {description: Acknowledged. Anything else is retried.}
-  paymentExecuted:
-    post:
-      x-settla-status: proposed
-      summary: The bank settled the payment. This is the only event that means money moved.
-      requestBody:
-        content:
-          application/json:
-            schema: {$ref: "#/components/schemas/WebhookEvent"}
-      responses:
-        "200": {description: Acknowledged.}
 
 components:
   securitySchemes:
     ApiKey:
       type: http
       scheme: bearer
-      bearerFormat: sk_live_…
+      bearerFormat: settla_sk_…
       description: |
-        Created in the Settla portal and shown once. A key acts for exactly one
-        account and sees nothing outside it. A key cannot move money: everything
-        it creates waits for a human BankID signature.
+        Created in the Settla portal under Profil and shown exactly once —
+        only an HMAC is stored, so there is no "show again". A key acts for
+        exactly one account and sees nothing outside it. A key cannot sign:
+        everything it places waits for a human BankID signature.
+
+        `Authorization: Bearer settla_sk_…` is the only accepted form. A key
+        in a query string is rejected — query strings reach access logs,
+        browser history and referrer headers.
 
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
       in: header
-      required: true
+      required: false
       description: |
-        Required on every creating request. Replaying the same key returns the
-        original object instead of creating a second one. This is what makes an
-        agent's retry loop safe.
-      schema: {type: string, maxLength: 255}
-    SettlaVersion:
-      name: Settla-Version
+        Replaying the same key resolves to the payment that already exists at
+        the bank instead of placing a second one. Optional because a safe one
+        is derived from what the payment IS when the header is absent — but an
+        agent's retry loop should send its own.
+      schema: {type: string, maxLength: 64}
+    UserIp:
+      name: X-User-Ip
       in: header
       required: false
-      description: The dated contract version this integration was written against.
-      schema: {type: string, example: "2026-08-13"}
+      description: |
+        The person's own IP, where your system honestly knows it. It travels
+        to the bank as the PSU address; some banks meter reads differently
+        without it.
+      schema: {type: string}
 
   responses:
     BadRequest:
-      description: The request could not be read.
+      description: The request could not be accepted; the message names the field and the way out.
       content:
         application/json:
           schema: {$ref: "#/components/schemas/Error"}
     Unauthorized:
-      description: Missing, unknown or revoked key.
+      description: |
+        Missing, malformed, unknown or revoked key. Deliberately one
+        indistinguishable answer: which half of a guess was right is not told.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    NotOnboarded:
+      description: |
+        `not_onboarded` — the account behind the key has fallen out of the
+        onboarding gate (a lapsed bank connection, an unverified email). The
+        gate is re-checked on every call, not trusted from mint time.
       content:
         application/json:
           schema: {$ref: "#/components/schemas/Error"}
     NotFound:
-      description: No such object on this key's account.
-      content:
-        application/json:
-          schema: {$ref: "#/components/schemas/Error"}
-    IdempotencyConflict:
-      description: The same Idempotency-Key was used with a different body.
-      content:
-        application/json:
-          schema: {$ref: "#/components/schemas/Error"}
-    ValidationFailed:
       description: |
-        The request was understood and rejected — a failed OCR check digit, an
-        IBAN that fails mod-97, a bankaccount recipient with no name.
+        No such resource, or it does not belong to this account — the two are
+        deliberately the same answer.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    NotImplemented:
+      description: |
+        `not_implemented` — declared at GET /v1 and not built yet. A roadmap,
+        not a bug.
       content:
         application/json:
           schema: {$ref: "#/components/schemas/Error"}
     RateLimited:
-      description: Too many attempts from this address.
+      description: Too many attempts from this address. Retry after the header says so.
 
   schemas:
     Error:
       type: object
       required: [error]
       properties:
-        error: {type: string, description: A stable machine-readable code.}
-        message: {type: string, description: What went wrong, in English.}
-        field: {type: string, description: The offending field, where there is one.}
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string, description: Stable and machine-readable.}
+            message:
+              type: string
+              description: |
+                For a developer's console, in English — except where a bank's
+                own refusal is passed through, which arrives as the bank gave
+                it.
+            docs: {type: string, format: uri}
+
+    Capability:
+      type: object
+      required: [method, path, kind, summary]
+      properties:
+        method: {type: string, enum: [GET, POST]}
+        path: {type: string, examples: ["/v1/payments"]}
+        kind:
+          type: string
+          enum: [read, act, signed]
+          description: |
+            `read` answers immediately. `act` changes something that is
+            Settla's to change, immediately. `signed` returns a signing order
+            a human completes in BankID.
+        summary: {type: string}
 
     Amount:
       type: string
-      pattern: "^[0-9]+\\.[0-9]{2}$"
+      pattern: "^[0-9]+(\\.[0-9]{1,2})?$"
       description: |
-        A decimal string with exactly two places — never a float, never öre as
-        an integer. Floats lose money in the last place and integers get
-        misread as kronor.
-      examples: ["7031.00", "1010.56"]
+        A decimal string, dot decimal, at most two places — never a float,
+        never öre as an integer. A JSON number is accepted on input but is
+        refused, not rounded, if it does not survive two decimals.
+      examples: ["7031.00", "250"]
 
-    Currency:
-      type: string
-      pattern: "^[A-Z]{3}$"
-      description: ISO 4217. Both SEK and foreign-currency invoices occur.
-      examples: ["SEK", "EUR"]
-
-    Recipient:
+    Bank:
       type: object
-      description: |
-        One of four kinds. `bankgiro` and `plusgiro` are looked up in the giro
-        registers, so no name is needed. `bankaccount` has no register behind it
-        and therefore requires `name`. `iban` is EUR within the EU/EEA.
-      required: [kind]
+      required: [id, name]
       properties:
-        kind:
-          type: string
-          enum: [bankgiro, plusgiro, bankaccount, iban]
-        number:
-          type: string
-          description: |
-            The giro number (`5099-2429`), the IBAN
-            (`LT643250090327964206`), or the account number when
-            `kind: bankaccount`. Separators are ignored.
-        clearing:
-          type: string
-          description: "Required when `kind: bankaccount`."
-        name:
-          type: string
-          description: |
-            Required when `kind: bankaccount`, because nothing can be looked up.
-            Ignored for the giro kinds, where the register is authoritative.
-      examples:
-        - {kind: bankgiro, number: "5099-2429"}
-        - {kind: iban, number: "LT643250090327964206"}
-        - {kind: bankaccount, clearing: "8327-9", number: "64206", name: "Millar Konsult AB"}
+        id: {type: string, description: What every call that names a bank must carry., examples: [nordea]}
+        name: {type: string, examples: [Nordea]}
+        ais: {type: boolean, description: Can be connected and read today.}
+        pis: {type: boolean, description: A payment has actually been executed through this bank.}
+        aisNote: {type: string, description: Why not, when `ais` is false. Swedish, as the bank module gives it.}
+        pisNote: {type: string, description: Why not, when `pis` is false.}
 
-    Reference:
+    AccountsOverview:
       type: object
-      description: An OCR number or a free-text message. Many invoices have neither.
       properties:
-        ocr:
-          type: string
-          description: |
-            Validated with a Luhn check and, where the invoice states one, a
-            length check. A failing OCR is rejected rather than sent — the bank
-            would reject it later, after the signature.
-          examples: ["1234567897"]
-        message:
-          type: string
-          maxLength: 140
+        read_at: {type: string, format: date-time}
+        banks:
+          type: array
+          items:
+            type: object
+            required: [bank, connected]
+            properties:
+              bank: {type: string}
+              name: {type: string}
+              connected: {type: boolean}
+              expired: {type: boolean, description: The consent has lapsed; reconnect to read again.}
+              failed: {type: boolean, description: The bank answered badly. The row is reported, never dropped.}
+              message: {type: [string, "null"]}
+              complete: {type: boolean, description: Whether every balance figure came back.}
+              consent_expires_at: {type: [string, "null"], format: date-time}
+              accounts:
+                type: array
+                items: {$ref: "#/components/schemas/Account"}
 
-    SignerHint:
+    Account:
       type: object
-      description: |
-        Who you expect to sign. Optional: anyone holding the `sign_url` and a
-        BankID may sign, and the signature records who actually did. Supplying
-        it lets Settla mail the link and lets you detect a mismatch.
-      properties:
-        name: {type: string}
-        email: {type: string, format: email}
-        personal_number:
-          type: string
-          description: 12 digits. Stored and returned masked.
-          examples: ["197908261234"]
-
-    PaymentStatus:
-      type: string
-      enum: [created, signed, executed, declined, expired, failed]
-      description: |
-        `signed` means a person signed the authorisation. It does **not** mean
-        money moved; only `executed` does, and only the bank sets it.
-
-    PaymentCreate:
-      type: object
-      required: [recipient, amount, currency]
-      properties:
-        recipient: {$ref: "#/components/schemas/Recipient"}
-        amount: {$ref: "#/components/schemas/Amount"}
-        currency: {$ref: "#/components/schemas/Currency"}
-        reference: {$ref: "#/components/schemas/Reference"}
-        due_date: {type: string, format: date}
-        signer: {$ref: "#/components/schemas/SignerHint"}
-        attachment_sha256:
-          type: string
-          pattern: "^[0-9a-f]{64}$"
-          description: An invoice already uploaded, shown to the signer.
-        metadata:
-          type: object
-          additionalProperties: {type: string}
-          description: Your own identifiers, returned unchanged. Never shown to the payer.
-
-    Payment:
-      allOf:
-        - $ref: "#/components/schemas/PaymentCreate"
-        - type: object
-          required: [id, status, sign_url, created_at]
-          properties:
-            id: {type: string}
-            status: {$ref: "#/components/schemas/PaymentStatus"}
-            sign_url:
-              type: string
-              format: uri
-              description: Where a person signs. Give it to them; do not open it yourself.
-            created_at: {type: string, format: date-time}
-            signed_at:
-              type: [string, "null"]
-              format: date-time
-            executed_at:
-              type: [string, "null"]
-              format: date-time
-              description: |
-                Set only when the bank has settled. Null on a signed payment,
-                and the field to reconcile against — not `signed_at`.
-            signed_by:
-              type: object
-              description: Who actually signed, from BankID. Absent until signed.
-              properties:
-                name: {type: string}
-                personal_number: {type: string, examples: ["19790826-****"]}
-            evidence_url:
-              type: [string, "null"]
-              format: uri
-            decline_reason: {type: [string, "null"]}
-
-    PaymentBatch:
-      type: object
-      required: [id, status, sign_url, payments]
+      required: [id, number, currency]
       properties:
         id: {type: string}
-        status: {$ref: "#/components/schemas/PaymentStatus"}
-        sign_url: {type: string, format: uri, description: One signature covers every payment.}
-        total: {$ref: "#/components/schemas/Amount"}
-        currency: {$ref: "#/components/schemas/Currency"}
-        payments:
-          type: array
-          items: {$ref: "#/components/schemas/Payment"}
+        number: {type: string, description: IBAN or BBAN as the bank reported it.}
+        name: {type: [string, "null"], description: The bank's own label ("Privatkonto").}
+        currency: {type: string}
+        balance:
+          type: [number, "null"]
+          description: Null when no poll has observed the account — never 0.
+        balance_observed_at: {type: [string, "null"], format: date-time}
 
-    PaymentRequestCreate:
+    TransactionsAnswer:
       type: object
-      required: [kind, total, currency]
       properties:
-        kind: {type: string, enum: [single, group]}
-        total: {$ref: "#/components/schemas/Amount"}
-        currency: {$ref: "#/components/schemas/Currency"}
-        message: {type: string, maxLength: 500}
-        participants:
+        account:
+          type: object
+          properties:
+            id: {type: string}
+            number: {type: string}
+            currency: {type: string}
+            bank: {type: string}
+        updated_at: {type: [string, "null"], format: date-time}
+        transactions:
           type: array
-          minItems: 1
-          description: |
-            One for `single`. For `group` the total is split evenly across them,
-            with any remainder distributed a öre at a time rather than dropped.
           items:
             type: object
             properties:
-              name: {type: string}
-              email: {type: string, format: email}
-              amount:
-                $ref: "#/components/schemas/Amount"
-                description: Overrides the even split for this participant.
-        attachment_sha256: {type: string, pattern: "^[0-9a-f]{64}$"}
+              id: {type: string}
+              amount: {type: number}
+              currency: {type: string}
+              booking_date: {type: [string, "null"]}
+              value_date: {type: [string, "null"]}
+              narrative: {type: [string, "null"]}
+              counterparty: {type: [string, "null"]}
+              counterparty_account: {type: [string, "null"]}
+              reference: {type: [string, "null"]}
+              message: {type: [string, "null"]}
+              type: {type: [string, "null"]}
+              balance_after: {type: [number, "null"]}
+              status: {type: [string, "null"]}
+
+    PaymentPlace:
+      type: object
+      required: [from_account, to_account, creditor_name, amount]
+      properties:
+        from_account:
+          type: string
+          description: One of the person's own accounts, from GET /v1/accounts.
+        to_account:
+          type: string
+          description: An IBAN, or a giro number with `to_account_type` set.
+        to_account_type:
+          type: string
+          enum: [IBAN, BGNR, PGNR]
+          description: |
+            Required for giro numbers: the service refuses to guess between
+            the bankgiro and plusgiro registers.
+        creditor_name:
+          type: string
+          maxLength: 70
+          description: Required — the bank shows the signer who is being paid.
+        amount: {$ref: "#/components/schemas/Amount"}
+        reference:
+          type: string
+          pattern: "^[0-9]{2,25}$"
+          description: An OCR number. Free text goes in `message`.
+        message: {type: string, maxLength: 140}
+        bank:
+          type: string
+          description: Optional — resolved from `from_account` when absent.
+        same_device: {type: boolean, default: false}
+        user_ip: {type: string}
+
+    Payment:
+      type: object
+      required: [id, bank, amount, currency, status]
+      properties:
+        id: {type: string}
+        bank: {type: string}
+        amount: {type: number}
+        currency: {type: string}
+        to_account: {type: string}
+        creditor_name: {type: [string, "null"]}
+        reference: {type: [string, "null"]}
+        created_at: {type: string, format: date-time}
+        status: {type: string, description: The service's own status word for the payment's stage.}
+        label:
+          type: [string, "null"]
+          description: |
+            What to show a person, in Swedish. Deliberately never "settled" or
+            "paid" — a signed payment can still be reversed before clearing,
+            and that conclusion is the recipient's to draw.
+        detail: {type: [string, "null"]}
+        signed: {type: boolean}
+        final: {type: boolean, description: Whether the bank's answer can still change.}
+
+    SigningOrderEnvelope:
+      type: object
+      required: [order]
+      properties:
+        order:
+          type: object
+          required: [id, kind, status]
+          properties:
+            id: {type: string, examples: ["ord_9f2c66d1a03b71e4c8d20a55"]}
+            kind: {type: string, enum: [payment, bank_connection]}
+            bank: {type: string}
+            status: {type: string, enum: [pending, completed, failed, expired]}
+            qr_data:
+              type: [string, "null"]
+              description: |
+                The string to render as a BankID QR. Rotates about once a
+                second — render what the latest poll returns.
+            qr_image:
+              type: [string, "null"]
+              description: |
+                Some banks send a finished PNG (base64) instead of a string to
+                encode, and for those it is the ONLY thing sent. Prefer it
+                when present.
+            autostart_token:
+              type: [string, "null"]
+              description: |
+                For the device that holds the BankID app: launch
+                `bankid:///?autostarttoken=…&redirect=null`. Rotates at some
+                banks — the freshest wins.
+            signature:
+              type: object
+              description: |
+                Which signature of how many is in front of the person — some
+                banks approve the recipient first, then the money.
+              properties:
+                ordinal: {type: integer}
+                purpose: {type: string}
+            poll: {type: string, description: The route to poll., examples: ["/v1/orders/ord_…"]}
+            reason: {type: [string, "null"], description: Why, when failed or expired.}
+            payment:
+              type: object
+              description: On a completed payment order — the outcome, in the bank's words.
+              properties:
+                id: {type: string, description: The payment's id in GET /v1/payments.}
+                status: {type: string}
+                bank_status: {type: string, description: The bank's own status code, as given.}
+                label: {type: [string, "null"]}
+                detail: {type: [string, "null"]}
+                signed: {type: boolean}
+            bank_connection:
+              type: object
+              description: On a completed bank-connection order.
+              properties:
+                bank: {type: string}
+                consent_expires_at: {type: string, format: date-time}
+                accounts:
+                  type: array
+                  items: {$ref: "#/components/schemas/Account"}
 
     PaymentRequest:
-      allOf:
-        - $ref: "#/components/schemas/PaymentRequestCreate"
-        - type: object
-          required: [id, created_at, participants]
-          properties:
-            id: {type: string}
-            created_at: {type: string, format: date-time}
-            outstanding:
-              $ref: "#/components/schemas/Amount"
-              description: What is still unpaid across every participant.
-            participants:
-              type: array
-              items:
-                type: object
-                properties:
-                  id: {type: string}
-                  name: {type: string}
-                  email: {type: string, format: email}
-                  amount: {$ref: "#/components/schemas/Amount"}
-                  status: {type: string, enum: [pending, paid, declined]}
-                  pay_url:
-                    type: string
-                    format: uri
-                    description: This participant's own link. Not shared with the others.
-                  paid_at: {type: [string, "null"], format: date-time}
-
-    CheckoutSessionCreate:
       type: object
-      required: [amount, currency, return_url]
+      required: [id, kind, total, currency, participants]
       properties:
-        amount: {$ref: "#/components/schemas/Amount"}
-        currency: {$ref: "#/components/schemas/Currency"}
-        reference: {$ref: "#/components/schemas/Reference"}
-        return_url:
-          type: string
-          format: uri
-          description: Where the customer is sent afterwards, paid or not.
-        merchant_name:
-          type: string
-          description: Shown to the customer so they know whose checkout they are in.
-        collect_address:
-          type: boolean
-          default: false
+        id: {type: string}
+        kind: {type: string, enum: [single, group]}
+        total: {$ref: "#/components/schemas/Amount"}
+        currency: {type: string, const: SEK}
+        message: {type: [string, "null"]}
+        created_at: {type: string, format: date-time}
+        cancelled_at: {type: [string, "null"], format: date-time}
+        settled: {type: boolean, description: Every participant has paid or declined.}
+        outstanding: {$ref: "#/components/schemas/Amount"}
+        participants:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string}
+              name: {type: [string, "null"]}
+              email: {type: [string, "null"]}
+              amount: {$ref: "#/components/schemas/Amount"}
+              status: {type: string, enum: [pending, paid, declined]}
+              paid_at: {type: [string, "null"], format: date-time}
+              url:
+                type: string
+                format: uri
+                description: |
+                  This participant's own link — the whole relationship. Not
+                  shared between participants, so who has paid stays tellable.
+        unsent:
+          type: array
+          items: {type: string, format: email}
           description: |
-            Ask for a delivery address. The customer must consent per
-            transaction; refusing does not block the payment, it withholds the
-            address.
-        metadata:
-          type: object
-          additionalProperties: {type: string}
+            Participants whose link could not be mailed. Their links are in
+            `participants[].url`; deliver them yourself.
 
-    CheckoutSession:
-      allOf:
-        - $ref: "#/components/schemas/CheckoutSessionCreate"
-        - type: object
-          required: [id, checkout_url, status]
-          properties:
-            id: {type: string}
-            checkout_url: {type: string, format: uri}
-            status: {type: string, enum: [open, completed, abandoned, expired]}
-            payment: {$ref: "#/components/schemas/Payment"}
-            customer:
-              type: object
-              description: Present only where the customer consented to release it.
-              properties:
-                name: {type: string}
-                personal_number: {type: string, examples: ["19790826-****"]}
-                address:
-                  type: object
-                  properties:
-                    street: {type: string}
-                    postal_code: {type: string}
-                    city: {type: string}
-
-    Document:
+    DocumentSummary:
       type: object
-      required: [id, filename, status, sha256, parties]
+      required: [id, filename, status, sha256]
       properties:
         id: {type: string}
         filename: {type: string}
-        sha256: {type: string, pattern: "^[0-9a-f]{64}$"}
         status:
           type: string
           enum: [awaiting_sender, awaiting_parties, signed, declined, expired]
-        final_sha256:
-          type: [string, "null"]
-          description: The completed file with its signature page, once everyone has signed.
+        created_at: {type: string, format: date-time}
+        sent_at: {type: [string, "null"], format: date-time}
+        expires_at: {type: [string, "null"], format: date-time}
+        self_signed: {type: boolean}
+        sha256: {type: string}
+        final_sha256: {type: [string, "null"]}
+        signatures: {type: integer, description: How many have been collected.}
         parties:
           type: array
           items:
             type: object
             properties:
               id: {type: string}
-              name: {type: string}
-              email: {type: string, format: email}
+              email: {type: string}
               status: {type: string, enum: [pending, signed, declined]}
-              sign_url: {type: string, format: uri}
+              name: {type: [string, "null"]}
               signed_at: {type: [string, "null"], format: date-time}
-        evidence_url: {type: [string, "null"], format: uri}
+
+    ApiKey:
+      type: object
+      required: [id, name, created_at, active]
+      description: Never carries the secret or its hash — the shape has no field for them.
+      properties:
+        id: {type: string}
+        name: {type: string}
+        created_at: {type: string, format: date-time}
+        last_used_at: {type: [string, "null"], format: date-time}
+        revoked_at: {type: [string, "null"], format: date-time}
+        active: {type: boolean}
 
     WebhookEvent:
       type: object

@@ -4,70 +4,165 @@ The public HTTP API companies use to move money from their own systems — an
 ERP, a billing job, a checkout, or an AI agent acting for a person — where a
 human with a BankID is always the last word.
 
-> ## Status: not live
+> ## Status: live
 >
-> **Nothing under `/v1` is implemented.** No base URL is allocated, no API keys
-> exist, and no endpoint in this repository will answer a request today. This is
-> the contract, published while it is still cheap to change, so the companies
-> who will use it can argue with it before it is built.
+> **`/v1` answers.** API keys exist, are created in the Settla portal, and the
+> capabilities marked **Live** below work today against the running service.
+> The service's own declaration of what it can do is `GET /v1` — public, no
+> key — and every capability it lists carries a kind: `read`, `act` or
+> `signed`. Where this repository and a running answer disagree, the running
+> answer wins; open an issue so we fix the text.
 >
-> Two endpoints *are* live and callable right now, and they are marked **Live**
-> below: the public document verifier. They need no key and no account.
->
-> Follow this repository for the change from proposed to live. When it happens,
-> this block is what will say so.
+> Capabilities marked **Proposed** below are still contract-only: batches,
+> hosted checkout, webhooks, and sending documents for signature through the
+> API. They answer `501 not_implemented`, which is a roadmap, not a bug.
 
 ## What Settla is
 
-A Swedish signing and settlement service where **BankID is the only key**. There
+A Swedish signing and payment service where **BankID is the only key**. There
 are no passwords: a personnummer identifies a person, and an account is created
 the first time they log in.
 
-**Settla never holds money.** Payments settle directly from the payer's own bank
-account to the recipient. There is no Settla balance, wallet or float, and no
-API call can create one.
+**Settla never holds money.** A payment is placed at the payer's own bank and
+settles from their account to the recipient's. There is no Settla balance,
+wallet or float, and no API call can create one.
 
 ## The one rule this API is built around
 
-**An API key cannot move money.** A key lets your system *prepare* a payment. It
-produces something a person must then sign with their BankID, and the signature
-— not the API call — is the instruction. This is deliberate, and it is the
-reason an autonomous system can be given a key at all: the worst outcome of a
-leaked key, a bad prompt or a runaway loop is a queue of payments nobody signs.
+**An API key cannot sign.** A key lets your system *prepare* — place a payment
+at the bank, open a bank connection — and every one of those preparations ends
+in a BankID signature by a named human, in their BankID app, on their own
+device. The signature, not the API call, is what moves money. This is
+deliberate, and it is the reason an autonomous system can be given a key at
+all: the worst outcome of a leaked key, a bad prompt or a runaway loop is a
+queue of unsigned orders that expire.
 
-So every payment moves through the same three stages:
+So every capability is one of three declared kinds:
 
-| Stage | Who acts | What exists |
-|---|---|---|
-| `created` | your system, with an API key | An authorisation, with a URL a person can open |
-| `signed` | a person, with BankID | A signed authorisation, with evidence attached |
-| `executed` | the bank | Money has moved |
+| Kind | What it means |
+|---|---|
+| `read` | Answers immediately. The majority. |
+| `act` | Changes something that is Settla's to change — cancelling a request, revoking a key. Immediate. |
+| `signed` | Places the thing and returns a **signing order**: a QR to show, an autostart token for the device that holds the BankID app, and one route to poll. The person signs; you poll. |
 
-The gap between `signed` and `executed` is real and is not a formality — see
-[What `signed` does not mean](#what-signed-does-not-mean).
+A caller integrating `signed` endpoints is not doing bank integration. Behind
+one identical flow sit several Swedish banks with different authorisation
+models, payment products and status vocabularies — absorbing that difference
+is the product.
 
 ## Endpoints
 
+The authoritative list is `GET /v1`. As of 2026-08-17:
+
 | Endpoint | Purpose | Status |
 |---|---|---|
-| `POST /api/verify` | Check whether a PDF is a document Settla holds signatures for | **Live** |
-| `GET /api/verify/evidence/{sha256}` | Download the raw BankID evidence for that document | **Live** |
-| `POST /v1/payments` | Prepare one payment for signature | Proposed |
-| `POST /v1/payments/batch` | Prepare several payments settled under one signature | Proposed |
-| `GET /v1/payments/{id}` | Read a payment's stage | Proposed |
-| `POST /v1/payment-requests` | Ask someone for money; returns a link per payer | Proposed |
-| `GET /v1/payment-requests/{id}` | Read who has paid | Proposed |
-| `POST /v1/checkout/sessions` | Hand a customer to Settla's hosted checkout and get them back | Proposed |
-| `POST /v1/documents` | Send a document for signature | Proposed |
-| `GET /v1/documents/{id}` | Read who has signed and who is outstanding | Proposed |
+| `GET /v1` | The capability list itself. No key needed. | **Live** |
+| `GET /v1/me` | The account behind this key | **Live** |
+| `GET /v1/banks` | Banks that can be connected and paid from, with per-bank availability | **Live** |
+| `GET /v1/accounts` | Every account at every connected bank, with balances (`?refresh=false` reads without touching the banks) | **Live** |
+| `GET /v1/accounts/{id}/transactions` | Transactions for one account | **Live** |
+| `POST /v1/bank-connections` | Connect a bank — returns a signing order | **Live** |
+| `POST /v1/payments` | Place one payment — returns a signing order | **Live** |
+| `GET /v1/orders/{id}` | Poll a signing order: pending (QR rotates), completed, failed, expired | **Live** |
+| `POST /v1/payments/{id}/cancel` | Withdraw an unsigned payment, by its order id | **Live** |
+| `GET /v1/payments` · `GET /v1/payments/{id}` | Payments placed through Settla, with the bank's own status | **Live** |
+| `POST /v1/payment-requests` | Ask one or more people for money; returns and mails a link per payer | **Live** |
+| `GET /v1/payment-requests` · `POST /v1/payment-requests/{id}/cancel` | Read who has paid; withdraw | **Live** |
+| `GET /v1/documents` | Documents sent for signature, with signing state | **Live** |
+| `GET /v1/documents/{id}/evidence` | The BankID evidence for a document you sent | **Live** |
+| `GET /v1/api-keys` · `POST /v1/api-keys/{id}/revoke` | Enumerate and kill this account's keys, from code | **Live** |
+| `GET /v1/events` | A held-open SSE stream: nudges when your account's state changes | **Live** |
+| `POST /api/verify` | Check whether a PDF is a document Settla holds signatures for. No key. | **Live** |
+| `GET /api/verify/evidence/{sha256}` | The raw BankID evidence for that document. No key. | **Live** |
+| `POST /v1/documents` · `POST /v1/documents/{id}/sign` | Send and sign documents through the API | Proposed |
+| `POST /v1/payments/batch` | Several payments under one signature | Proposed |
+| `POST /v1/checkout/sessions` | Hosted checkout | Proposed |
+| Webhooks | Push delivery of outcomes | Proposed |
 
-The full contract, including every field and error, is in
-[`openapi.yaml`](openapi.yaml).
+The request and response shapes are in [`openapi.yaml`](openapi.yaml).
 
-## Verification, which works today
+## Authentication
 
-The verifier is public, unauthenticated, and answers on the running portal. You
-hold the file; the hash is the entitlement. Nothing is stored.
+```
+Authorization: Bearer settla_sk_…
+```
+
+Keys are created in the Settla portal under **Profil**, and are shown exactly
+once — the service stores only an HMAC, so there is no "show again". A key is
+issued only to a finished account: identity proven with BankID, terms
+accepted, e-mail verified, a bank account connected. That gate is re-checked on
+every call, not trusted from mint time.
+
+A key authenticates; it does not authorise beyond the person. It reaches
+exactly what the person could reach logged in — one account, nothing else —
+and it can revoke itself, which is the correct response to a leak.
+
+`Idempotency-Key` is honoured on `POST /v1/payments`: replaying with the same
+key resolves to the payment that already exists at the bank rather than
+placing a second one. Without the header one is derived from what the payment
+*is* (payer, source, destination, amount, reference), so an identical retry is
+safe by default. A `Settla-Version` header is proposed, not yet live.
+
+## Signing, and how your system finds out
+
+A `signed` endpoint answers `201` with an order:
+
+```json
+{ "order": { "id": "ord_…", "kind": "payment", "bank": "nordea",
+             "status": "pending", "qr_data": "bankid.…", "qr_image": null,
+             "autostart_token": "…", "poll": "/v1/orders/ord_…" } }
+```
+
+Show the person the QR (`qr_data` encodes it; some banks send a finished PNG
+in `qr_image` instead — carry both), or on the device that holds their BankID
+app, launch `bankid:///?autostarttoken=…`. **The QR rotates**: render what the
+latest poll returns, not what the start returned. Poll `GET /v1/orders/{id}`
+until `status` is `completed`, `failed` or `expired`. Orders are minutes-long;
+an order lost to a restart is re-placed, and idempotency resolves it to the
+same payment.
+
+For being told rather than asking, `GET /v1/events` holds open a Server-Sent
+Events stream of nudges — an event says *look again*, never the state itself;
+re-read the resource when nudged. Webhooks remain proposed.
+
+Do not treat your own API call as the outcome. The person may decline.
+
+## What a completed payment order does not mean
+
+A completed order means the payer **signed** and the bank **accepted** the
+payment. It does not mean the money has arrived. Between signature and
+clearing a payment can still fail or be reversed, and different banks report
+that window differently — some sit in a reversible accepted state until the
+next clearing cycle.
+
+So this API reports the bank's own words: each payment carries the bank's
+`status`, and a human-readable `label`/`detail` that deliberately never say
+"settled" or "paid". Whether money has arrived is the recipient's conclusion
+to draw, from their own account. Reconcile on what your bank statement shows,
+never on `signed`.
+
+## Amounts, recipients and references
+
+Swedish payment detail, because getting it wrong is the most common
+integration bug:
+
+- **Amounts** are decimal strings — `"7031.00"`, dot decimal, at most two
+  decimals. A number is accepted but is refused, not rounded, if it does not
+  survive two decimals. Domestic payments are SEK.
+- **Recipients** (`to_account`) are an IBAN, or a giro number with
+  `to_account_type` set to `BGNR` (bankgiro) or `PGNR` (plusgiro) —
+  the service refuses to guess between the two giro registers.
+  `creditor_name` is required: the bank shows the signer who is being paid.
+- **The source** (`from_account`) is one of the person's own accounts from
+  `GET /v1/accounts`. The bank is resolved from it; naming `bank` explicitly
+  is allowed and settles ambiguity.
+- **References**: a numeric `reference` (2–25 digits) is an OCR number; free
+  text goes in `message`.
+
+## Verification, which needs no key
+
+The verifier is public, unauthenticated, and answers on the running portal.
+You hold the file; the hash is the entitlement. Nothing is stored.
 
 ```sh
 curl -s -X POST https://test.settla.se/api/verify \
@@ -85,79 +180,11 @@ at all, using the open-source tool at
 
 `test.settla.se` is a test host and will change. Do not hard-code it.
 
-## Authentication (proposed)
-
-```
-Authorization: Bearer sk_live_…
-```
-
-Keys are created in the Settla portal, on a personal or a company account, and
-are shown exactly once. A key acts **for one account** — everything it creates
-belongs to that account and nothing else is visible to it.
-
-Two headers matter beyond the key:
-
-- `Idempotency-Key` — required on every POST that creates something. Replaying a
-  request with the same key returns the original object rather than making a
-  second one. Payments are exactly the place an agent's retry loop must not cost
-  money twice.
-- `Settla-Version` — the dated contract version your integration was written
-  against. Omitting it pins you to the account's default, which we may move.
-
-## Signing, and how your system finds out
-
-A created payment carries a `sign_url`. Give it to the person who must sign: put
-it in your own UI, mail it, or hand it to them in whatever channel your product
-already uses. They identify with BankID, see what they are signing, and sign it.
-They need no Settla account to pay.
-
-Your system learns the outcome in one of two ways:
-
-- **Webhooks** — `payment.signed`, `payment.executed`, `payment.declined`,
-  `payment.expired`, `request.paid`, `document.signed`. Each delivery is signed;
-  verify the signature before acting on the body.
-- **Polling** — `GET /v1/payments/{id}`, if you would rather not run an endpoint.
-
-Do not treat your own API call as the outcome. The person may decline.
-
-## What `signed` does not mean
-
-The portal today signs a payment *authorisation* and records it. It does not
-instruct any bank. The bank connection it holds is an **Account Information**
-consent — it can read the payer's accounts and balances after they identify at
-their bank, and that is all.
-
-Whether Settla may initiate payments, and under whose PSD2 authorisation, is an
-open legal question rather than an unfinished piece of code. Until it is settled,
-a payment reaching `signed` has moved no money, `executed_at` stays null, and
-nothing in this API will claim otherwise.
-
-This is stated here, in the spec, and on every screen the payer sees, for the
-same reason: an integrator who reads `signed` as `paid` will reconcile a month
-that never happened.
-
-## Amounts, recipients and references
-
-Swedish payment detail, because getting it wrong is the most common integration
-bug:
-
-- **Amounts** are decimal strings — `"7031.00"`, never a float and never öre as
-  an integer. Currency is ISO 4217. Both `SEK` and foreign-currency invoices
-  occur.
-- **Recipients** are one of four kinds: `bankgiro`, `plusgiro`, `bankaccount`
-  (clearing plus account number) and `iban`. `bankaccount` **requires a
-  recipient name**, because unlike the giro registers there is nothing to look
-  it up in.
-- **References** are either an OCR number, which is validated with a Luhn check
-  and a length check, or a free-text message. Not every invoice has either.
-- Amounts are displayed to the payer in Swedish convention (`7 031,00 SEK`)
-  regardless of how you send them.
-
 ## Contributing
 
-This contract is published to be argued with. If a field is missing, an error is
-unhelpful, or a flow does not survive contact with your system, open an issue —
-that is worth considerably more now than after it ships.
+This contract is published to be argued with. If a field is missing, an error
+is unhelpful, or a flow does not survive contact with your system, open an
+issue.
 
 ## Related
 
