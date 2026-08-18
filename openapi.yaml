@@ -147,11 +147,47 @@ paths:
         "401": {$ref: "#/components/responses/Unauthorized"}
 
   /v1/bank-connections:
+    get:
+      tags: [Banks]
+      operationId: listBankConnections
+      x-settla-status: live
+      summary: Connected banks, and how long each consent has left
+      description: |
+        A local read of the grant store — no bank call — so a timer may poll
+        it. Each row carries `days_left` and a `state` of `ok`, `expiring` or
+        `lapsed`. Bank consents last 90–180 days; renew a lapsing one with
+        POST /v1/bank-connections before it stops answering, rather than
+        discovering the lapse at the next read.
+      responses:
+        "200":
+          description: The connected banks, worst-first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connections:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        bank: {type: string, description: "Bank id, e.g. `nordea`."}
+                        bank_name: {type: string}
+                        state: {type: string, enum: [ok, expiring, lapsed]}
+                        expires_at: {type: string, format: date-time, nullable: true}
+                        days_left: {type: integer}
+                        estimated:
+                          type: boolean
+                          description: True when the date is our policy, not the bank's own word (every bank but Nordea).
+                        revocable_at_bank:
+                          type: boolean
+                          description: Whether disconnecting reaches the bank or only us.
+        "401": {$ref: "#/components/responses/Unauthorized"}
     post:
       tags: [Banks]
       operationId: connectBank
       x-settla-status: live
-      summary: Connect a bank — returns a signing order
+      summary: Connect a bank (or renew a lapsing one) — returns a signing order
       description: |
         Raises the bank's own BankID order. Show the returned QR, or on the
         device that holds the BankID app pass `same_device: true` and launch
@@ -192,6 +228,37 @@ paths:
           content:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
+
+  /v1/bank-connections/{bank}/disconnect:
+    post:
+      tags: [Banks]
+      operationId: disconnectBank
+      x-settla-status: live
+      summary: Disconnect a bank
+      description: |
+        Withdraws the consent at the bank where the bank supports it, and
+        forgets it here so no lapse reminder fires for a connection the person
+        ended on purpose. `at_bank` says what reached the bank (`withdrawn`,
+        `not_supported` or `failed`).
+      parameters:
+        - name: bank
+          in: path
+          required: true
+          schema: {type: string}
+          description: A connected bank id from GET /v1/bank-connections.
+      responses:
+        "200":
+          description: The outcome of the disconnect.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  disconnected: {type: boolean}
+                  at_bank: {type: string, enum: [withdrawn, not_supported, failed]}
+                  reason: {type: string}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
 
   /v1/accounts:
     get:
@@ -391,6 +458,37 @@ paths:
         "501": {$ref: "#/components/responses/NotImplemented"}
 
   # ------------------------------------------------------------ signing orders
+  /v1/orders:
+    get:
+      tags: [Signing orders]
+      operationId: listOrders
+      x-settla-status: live
+      summary: Signing orders in flight
+      description: |
+        The orders this process is holding right now, for this key's account.
+        Orders are minutes-long and held in memory, so this is a window into
+        what is signing — not a durable ledger. For history, read /v1/payments
+        and /v1/bank-connections. After a restart the list is empty.
+      responses:
+        "200":
+          description: The in-flight orders.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: {type: string}
+                        kind: {type: string, enum: [bank_connection, payment]}
+                        bank: {type: string}
+                        created_at: {type: string, format: date-time}
+                        poll: {type: string, description: "The route to poll, /v1/orders/{id}."}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
   /v1/orders/{id}:
     get:
       tags: [Signing orders]
@@ -500,6 +598,33 @@ paths:
                     items: {$ref: "#/components/schemas/PaymentRequest"}
         "401": {$ref: "#/components/responses/Unauthorized"}
 
+  /v1/payment-requests/{id}:
+    get:
+      tags: [Payment requests]
+      operationId: getPaymentRequest
+      x-settla-status: live
+      summary: One payment request
+      description: |
+        The request, its participants, their pay links and who has paid.
+        Readable only by the account that raised it; another account's id is a
+        404, never a 403 — an answer that told them apart would confirm the id.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: The request.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request: {$ref: "#/components/schemas/PaymentRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
   /v1/payment-requests/{id}/cancel:
     post:
       tags: [Payment requests]
@@ -555,6 +680,33 @@ paths:
       description: Proposed. Until it is built, documents are sent from the portal.
       responses:
         "501": {$ref: "#/components/responses/NotImplemented"}
+
+  /v1/documents/{id}:
+    get:
+      tags: [Documents]
+      operationId: getDocument
+      x-settla-status: live
+      summary: One document
+      description: |
+        The document and its signing state. Readable only by the account that
+        sent it; another sender's id is a 404. For the sealed file and its
+        signature evidence, use /v1/documents/{id}/evidence.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: The document.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document: {$ref: "#/components/schemas/DocumentSummary"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
 
   /v1/documents/{id}/sign:
     post:
