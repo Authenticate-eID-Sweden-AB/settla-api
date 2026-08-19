@@ -52,6 +52,10 @@ tags:
     description: The BankID orders behind every `signed` endpoint.
   - name: Payment requests
     description: Ask someone for money. The payer needs no Settla account.
+  - name: Contacts
+    description: |
+      Who this account already deals with. Not a directory — Settla's register
+      of its own users is deliberately unreachable with a key.
   - name: Documents
     description: Documents sent for signature, and their BankID evidence.
   - name: Events
@@ -653,6 +657,43 @@ paths:
         "401": {$ref: "#/components/responses/Unauthorized"}
         "404": {$ref: "#/components/responses/NotFound"}
 
+  # ------------------------------------------------------------------ contacts
+  /v1/contacts:
+    get:
+      tags: [Contacts]
+      operationId: listContacts
+      x-settla-status: live
+      summary: Who this account pays, asks and sends documents to
+      description: |
+        The account's own contact book, in the same merged shape the portal
+        renders: what Settla has learned from payments, requests and documents
+        on this account, folded together with the frequent counterparties mined
+        from the account holder's own bank history.
+
+        Nothing here is a directory. Every entry is a counterparty this account
+        has already dealt with, and Settla's register of its own users is
+        deliberately not reachable through an API key: the search budget that
+        protects it is per person, and a key is exactly what would multiply what
+        that budget caps.
+
+        No personnummer appears in the response, because none is stored. A
+        contact who is themselves a Settla user is held as a reference to their
+        account, and their current name and payout are resolved when they are
+        paid — so a saved contact pays the account somebody has now, not the one
+        they had when you saved them.
+      responses:
+        "200":
+          description: The book, most-paid first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  contacts:
+                    type: array
+                    items: {$ref: "#/components/schemas/Contact"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
   # ----------------------------------------------------------------- documents
   /v1/documents:
     get:
@@ -1240,6 +1281,35 @@ components:
           description: |
             Participants whose link could not be mailed. Their links are in
             `participants[].url`; deliver them yourself.
+
+    Contact:
+      type: object
+      description: One counterparty and every way this account can reach them.
+      properties:
+        name:
+          type: [string, "null"]
+          description: What Settla shows for them; null when nothing has named them yet.
+        name_source:
+          type: [string, "null"]
+          enum: [user, settla, giro-register, bank, platform, null]
+          description: |
+            Where the name came from, in the order it is trusted. `user` is the
+            account holder's own label and outranks everything; `settla` is a
+            name BankID proved; `bank` is what the statement said.
+        emails:
+          type: array
+          items: {type: string, format: email}
+        destinations:
+          type: array
+          items:
+            type: object
+            properties:
+              type: {type: string, enum: [iban, bban, bgnr, pgnr, swish]}
+              account: {type: [string, "null"], description: Absent for Swish, where the handle is the name.}
+              name: {type: [string, "null"]}
+        times_paid: {type: integer}
+        times_received: {type: integer}
+        last_at: {type: [string, "null"], description: Date of the most recent movement, YYYY-MM-DD.}
 
     DocumentSummary:
       type: object
