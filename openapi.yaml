@@ -694,6 +694,62 @@ paths:
                     items: {$ref: "#/components/schemas/Contact"}
         "401": {$ref: "#/components/responses/Unauthorized"}
 
+  /v1/contacts/import:
+    post:
+      tags: [Contacts]
+      operationId: importContacts
+      x-settla-status: live
+      summary: Import an address book into this account's own contact book
+      description: |
+        Built for the Settla app, which offers the import once the person has
+        linked a personnummer to their phone number.
+
+        Idempotent on the phone number: re-sending the same address book updates
+        rather than duplicates. Numbers are normalised to E.164 on the way in,
+        because a number held in two shapes matches in neither — and a bare
+        number with no `+` and no leading zero is discarded rather than assumed
+        Swedish, since guessing a country code invents a different real person's
+        number. A row with neither a phone nor an address is skipped: a name on
+        its own is not a contact.
+
+        At most 2000 entries per call. Over that is refused rather than
+        truncated — importing the first 2000 of somebody's contacts and
+        answering 200 is a half-success discovered a month later.
+
+        This is the one place on this API that writes other people's details.
+        The imported contacts are held per account and never pooled between
+        accounts, and nothing is ever sent to the people in the imported book.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [contacts]
+              properties:
+                contacts:
+                  type: array
+                  maxItems: 2000
+                  items:
+                    type: object
+                    properties:
+                      name: {type: string, maxLength: 70}
+                      phone: {type: string, description: Any readable form; normalised to E.164.}
+                      email: {type: string, format: email}
+      responses:
+        "200":
+          description: What the import did.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imported: {type: integer, description: Contacts that did not exist before.}
+                  updated: {type: integer, description: Contacts already known, matched on phone or address.}
+                  skipped: {type: integer, description: Rows with no usable way to reach anybody.}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
   # ----------------------------------------------------------------- documents
   /v1/documents:
     get:
@@ -1299,6 +1355,10 @@ components:
         emails:
           type: array
           items: {type: string, format: email}
+        phones:
+          type: array
+          description: E.164. Mostly from the app's address-book import.
+          items: {type: string}
         destinations:
           type: array
           items:
